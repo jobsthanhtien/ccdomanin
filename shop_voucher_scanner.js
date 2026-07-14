@@ -1,4 +1,6 @@
 (function () {
+  window.VOUCHER_SCRIPT_LOADED = true;
+
 
   "use strict";
 
@@ -2292,7 +2294,7 @@
 
                                             <button class="multi-voucher-clear-btn" onclick="clearMultiVoucherInput()" title="Xóa"><i class="fas fa-times"></i></button>
 
-                                            <button class="multi-voucher-paste-bar" id="multiVoucherPasteBtn" onclick="pasteFromClipboardMulti()" title="Dán nội dung"><i class="fas fa-paste me-2"></i>Dán nội dung</button>
+                                            <button class="multi-voucher-paste-bar" id="multiVoucherPasteBtn" onclick="pasteFromClipboardMulti()" title="Dán nội dung"><i class="fas fa-paste me-2"></i>Dán nội dung</button><button class="multi-voucher-paste-bar" id="autoScanPageBtn" onclick="autoScanPageVouchers()" title="Quét toàn bộ voucher từ trang hiện tại" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); margin-left: 8px;"><i class="fas fa-search-plus me-2"></i>Quét trang hiện tại</button>
 
                                         </div>
 
@@ -10898,6 +10900,53 @@
 
     }
 
+        // Auto-scan all voucher codes and URLs on the current Shopee page
+    async function autoScanPageVouchers() {
+      const btn = document.getElementById("autoScanPageBtn");
+      if (btn) {
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang quét...';
+        btn.disabled = true;
+      }
+      try {
+        // 1. Extract all text content from the page
+        const pageText = document.body.innerText || "";
+        
+        // 2. Extract all Shopee URLs on the page
+        const links = [];
+        document.querySelectorAll("a").forEach(a => {
+          const href = a.href || "";
+          if (href.includes("shopee.vn") || href.includes("s.shopee.vn") || href.includes("shp.ee")) {
+            links.push(href);
+          }
+        });
+        
+        // Combine text and links
+        const combinedContent = pageText + "\n" + links.join("\n");
+        
+        // Fill input and start processing
+        const inputField = document.getElementById("multiVoucherInput");
+        if (inputField) {
+          inputField.value = combinedContent;
+          await processMultiVoucherInput(combinedContent.trim());
+        }
+        
+        if (btn) {
+          btn.innerHTML = '<i class="fas fa-check me-2"></i>Quét trang xong!';
+          setTimeout(() => {
+            btn.innerHTML = '<i class="fas fa-search-plus me-2"></i>Quét trang hiện tại';
+            btn.disabled = false;
+          }, 2000);
+        }
+      } catch (err) {
+        console.error("Lỗi quét trang:", err);
+        if (btn) {
+          btn.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>Lỗi quét trang';
+          btn.disabled = false;
+        }
+      }
+    }
+
+    window.autoScanPageVouchers = autoScanPageVouchers;
     window.togglePasteButtonToStop = togglePasteButtonToStop;
 
 
