@@ -10942,7 +10942,7 @@
       }
     }
 
-    // Auto-scan entire Shopee platform shop vouchers (Trending shops)
+    // Auto-scan entire Shopee platform shop vouchers (Crawl trending shops across sections)
     async function autoScanPlatformVouchers() {
       const btn = document.getElementById("autoScanPlatformBtn");
       if (btn) {
@@ -10952,36 +10952,47 @@
       try {
         const csrfToken = getFallbackCsrfToken();
         
-        // 1. Fetch trending items from homepage recommendation API to extract active Shop IDs
-        // Fetching 60 items covers a broad range of active sellers
-        const recUrl = "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60";
-        const recResponse = await fetch(recUrl, {
-          headers: {
-            accept: "application/json",
-            "x-csrftoken": csrfToken,
-          },
-          credentials: "include",
-        });
-        const recData = await recResponse.json();
+        // 1. Fetch from multiple trending bundles (Discover offset 0, offset 60, and Flash Sale)
+        // This yields a much broader, platform-wide coverage of active shop IDs!
+        const recUrls = [
+          "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60&offset=0",
+          "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60&offset=60",
+          "https://shopee.vn/api/v4/recommend/recommend?bundle=flash_sale_daily&limit=60"
+        ];
         
         let shopIds = new Set();
-        if (recData.data && Array.isArray(recData.data.sections)) {
-          recData.data.sections.forEach(sec => {
-            if (sec.data && Array.isArray(sec.data.item)) {
-              sec.data.item.forEach(item => {
-                if (item.shopid) {
-                  shopIds.add(item.shopid);
+        
+        for (const url of recUrls) {
+          try {
+            const recResponse = await fetch(url, {
+              headers: {
+                accept: "application/json",
+                "x-csrftoken": csrfToken,
+              },
+              credentials: "include",
+            });
+            const recData = await recResponse.json();
+            if (recData.data && Array.isArray(recData.data.sections)) {
+              recData.data.sections.forEach(sec => {
+                if (sec.data && Array.isArray(sec.data.item)) {
+                  sec.data.item.forEach(item => {
+                    if (item.shopid) {
+                      shopIds.add(item.shopid);
+                    }
+                  });
                 }
               });
             }
-          });
+          } catch (e) {
+            console.error("Lỗi khi tải danh sách gợi ý từ URL: " + url, e);
+          }
         }
         
         const uniqueShopIds = Array.from(shopIds);
-        console.log(`Tìm thấy ${uniqueShopIds.length} shop bán chạy.`);
+        console.log(`Tìm thấy ${uniqueShopIds.length} shop hoạt động bán chạy.`);
         
         if (uniqueShopIds.length === 0) {
-          alert("Không tìm thấy Shop bán chạy nào từ trang gợi ý. Vui lòng thử lại!");
+          alert("Không tìm thấy Shop bán chạy nào từ trang gợi ý Shopee. Vui lòng thử lại!");
           if (btn) {
             btn.innerHTML = '<i class="fas fa-globe me-2"></i>Quét toàn sàn';
             btn.disabled = false;
@@ -10999,7 +11010,8 @@
           }
           
           try {
-            const voucherUrl = `https://shopee.vn/api/v2/voucher_wallet/get_shop_vouchers_by_shopid?shop_id=${shopId}`;
+            // Note: shopid param (without underscore) is the correct parameters for this endpoint!
+            const voucherUrl = `https://shopee.vn/api/v2/voucher_wallet/get_shop_vouchers_by_shopid?shopid=${shopId}`;
             const vResponse = await fetch(voucherUrl, {
               headers: {
                 accept: "application/json",
@@ -11021,8 +11033,8 @@
           }
           
           processedShops++;
-          // Sleep tiny bit (100ms) to avoid rate limits
-          await new Promise(resolve => setTimeout(resolve, 100));
+          // Sleep tiny bit (80ms) to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 80));
         }
         
         // 3. Fill input field and trigger saving
