@@ -10951,7 +10951,7 @@
       }
       try {
         const csrfToken = getFallbackCsrfToken();
-        const pageUrls = ["/m/ma-giam-gia", "/m/voucher-shopee"];
+        const pageUrls = ["ma-giam-gia"];
         let allVoucherCodes = [];
         
         for (const pageUrl of pageUrls) {
@@ -10966,12 +10966,12 @@
             credentials: "include",
           });
           const pageData = await pageResponse.json();
-          if (pageData.error !== 0 || !pageData.data) continue;
+          if (pageData.error !== 0 || !pageData.layout) continue;
           
           // 2. Parse collections from layout response
           let voucherCollections = [];
-          if (pageData.data.layout && pageData.data.layout.component_list) {
-            for (const component of pageData.data.layout.component_list) {
+          if (pageData.layout && pageData.layout.component_list) {
+            for (const component of pageData.layout.component_list) {
               const component_id = component.id;
               const properties = component.properties;
               try {
