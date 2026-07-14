@@ -2294,7 +2294,9 @@
 
                                             <button class="multi-voucher-clear-btn" onclick="clearMultiVoucherInput()" title="Xóa"><i class="fas fa-times"></i></button>
 
-                                            <button class="multi-voucher-paste-bar" id="multiVoucherPasteBtn" onclick="pasteFromClipboardMulti()" title="Dán nội dung"><i class="fas fa-paste me-2"></i>Dán nội dung</button><button class="multi-voucher-paste-bar" id="autoScanPageBtn" onclick="autoScanPageVouchers()" title="Quét toàn bộ voucher từ trang hiện tại" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); margin-left: 8px;"><i class="fas fa-search-plus me-2"></i>Quét trang hiện tại</button>
+                                            <button class="multi-voucher-paste-bar" id="multiVoucherPasteBtn" onclick="pasteFromClipboardMulti()" title="Dán nội dung"><i class="fas fa-paste me-2"></i>Dán nội dung</button>
+<button class="multi-voucher-paste-bar" id="autoScanPageBtn" onclick="autoScanPageVouchers()" title="Quét toàn bộ voucher từ trang hiện tại" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); margin-left: 6px;"><i class="fas fa-search-plus me-2"></i>Quét trang này</button>
+<button class="multi-voucher-paste-bar" id="autoScanPlatformBtn" onclick="autoScanPlatformVouchers()" title="Quét toàn bộ mã từ cổng Voucher Portal Shopee" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); margin-left: 6px;"><i class="fas fa-globe me-2"></i>Quét toàn sàn</button>
 
                                         </div>
 
@@ -10900,7 +10902,7 @@
 
     }
 
-        // Auto-scan all voucher codes and URLs on the current Shopee page
+        // Auto-scan all voucher codes and URLs on the current Shopee page (HTML Scraping)
     async function autoScanPageVouchers() {
       const btn = document.getElementById("autoScanPageBtn");
       if (btn) {
@@ -10908,10 +10910,7 @@
         btn.disabled = true;
       }
       try {
-        // 1. Extract all text content from the page
         const pageText = document.body.innerText || "";
-        
-        // 2. Extract all Shopee URLs on the page
         const links = [];
         document.querySelectorAll("a").forEach(a => {
           const href = a.href || "";
@@ -10920,10 +10919,7 @@
           }
         });
         
-        // Combine text and links
         const combinedContent = pageText + "\n" + links.join("\n");
-        
-        // Fill input and start processing
         const inputField = document.getElementById("multiVoucherInput");
         if (inputField) {
           inputField.value = combinedContent;
@@ -10933,7 +10929,7 @@
         if (btn) {
           btn.innerHTML = '<i class="fas fa-check me-2"></i>Quét trang xong!';
           setTimeout(() => {
-            btn.innerHTML = '<i class="fas fa-search-plus me-2"></i>Quét trang hiện tại';
+            btn.innerHTML = '<i class="fas fa-search-plus me-2"></i>Quét trang này';
             btn.disabled = false;
           }, 2000);
         }
@@ -10946,7 +10942,126 @@
       }
     }
 
+    // Auto-scan entire Shopee platform vouchers via recommended microsite API
+    async function autoScanPlatformVouchers() {
+      const btn = document.getElementById("autoScanPlatformBtn");
+      if (btn) {
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang tải dữ liệu...';
+        btn.disabled = true;
+      }
+      try {
+        const csrfToken = getFallbackCsrfToken();
+        const pageUrls = ["/m/ma-giam-gia", "/m/voucher-shopee"];
+        let allVoucherCodes = [];
+        
+        for (const pageUrl of pageUrls) {
+          // 1. Fetch page layout builder data
+          const csrUrl = `https://shopee.vn/api/v4/pagebuilder/get_csr_page?page_url=${encodeURIComponent(pageUrl)}&platform=4&timestamp=0`;
+          const pageResponse = await fetch(csrUrl, {
+            method: "GET",
+            headers: {
+              accept: "application/json",
+              "accept-language": "vi",
+            },
+            credentials: "include",
+          });
+          const pageData = await pageResponse.json();
+          if (pageData.error !== 0 || !pageData.data) continue;
+          
+          // 2. Parse collections from layout response
+          let voucherCollections = [];
+          if (pageData.data.layout && pageData.data.layout.component_list) {
+            for (const component of pageData.data.layout.component_list) {
+              const component_id = component.id;
+              const properties = component.properties;
+              try {
+                const propertiesDecoded = JSON.parse(properties);
+                if (Array.isArray(propertiesDecoded)) {
+                  for (const property of propertiesDecoded) {
+                    if (property.key === "data" && property.value?.voucher_collection_id) {
+                      voucherCollections.push({
+                        collection_id: property.value.voucher_collection_id,
+                        component_id: component_id,
+                      });
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
+          if (!voucherCollections.length) continue;
+          
+          // 3. Batch request actual voucher details from microsite collections API
+          const requestList = voucherCollections.map((item) => ({
+            collection_id: item.collection_id.toString(),
+            component_type: 1,
+            component_id: item.component_id,
+            limit: 50,
+            microsite_id: 66938,
+            offset: 0,
+            number_of_vouchers_per_row: 1,
+          }));
+          
+          const detailResponse = await fetch(
+            "https://shopee.vn/api/v1/microsite/get_vouchers_by_collections",
+            {
+              method: "POST",
+              headers: {
+                accept: "application/json",
+                "accept-language": "en-US,en;q=0.9,vi;q=0.8",
+                "content-type": "application/json",
+                "x-csrftoken": csrfToken,
+              },
+              body: JSON.stringify({
+                voucher_collection_request_list: requestList,
+              }),
+              credentials: "include",
+            }
+          );
+          const detailData = await detailResponse.json();
+          if (detailData.data && Array.isArray(detailData.data)) {
+            detailData.data.forEach((collection) => {
+              if (collection.vouchers && Array.isArray(collection.vouchers)) {
+                collection.vouchers.forEach((voucherItem) => {
+                  const voucher = voucherItem.voucher;
+                  if (voucher && voucher.voucher_identifier && voucher.voucher_identifier.voucher_code) {
+                    allVoucherCodes.push(voucher.voucher_identifier.voucher_code);
+                  }
+                });
+              }
+            });
+          }
+        }
+        
+        // 4. Fill input and start auto-saving!
+        const inputField = document.getElementById("multiVoucherInput");
+        if (inputField && allVoucherCodes.length) {
+          const uniqueCodes = Array.from(new Set(allVoucherCodes));
+          const joinedCodes = uniqueCodes.join("\n");
+          inputField.value = joinedCodes;
+          await processMultiVoucherInput(joinedCodes.trim());
+        } else {
+          alert("Không tìm thấy mã giảm giá nào trên cổng voucher portal!");
+        }
+        
+        if (btn) {
+          btn.innerHTML = '<i class="fas fa-check me-2"></i>Quét xong toàn sàn!';
+          setTimeout(() => {
+            btn.innerHTML = '<i class="fas fa-globe me-2"></i>Quét toàn sàn';
+            btn.disabled = false;
+          }, 2000);
+        }
+      } catch (err) {
+        console.error("Lỗi quét toàn sàn:", err);
+        if (btn) {
+          btn.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>Lỗi quét sàn';
+          btn.disabled = false;
+        }
+      }
+    }
+
     window.autoScanPageVouchers = autoScanPageVouchers;
+    window.autoScanPlatformVouchers = autoScanPlatformVouchers;
     window.togglePasteButtonToStop = togglePasteButtonToStop;
 
 
