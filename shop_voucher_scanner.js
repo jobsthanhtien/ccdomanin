@@ -2296,7 +2296,7 @@
 
                                             <button class="multi-voucher-paste-bar" id="multiVoucherPasteBtn" onclick="pasteFromClipboardMulti()" title="Dán nội dung"><i class="fas fa-paste me-2"></i>Dán nội dung</button>
 <button class="multi-voucher-paste-bar" id="autoScanPageBtn" onclick="autoScanPageVouchers()" title="Quét toàn bộ voucher từ trang hiện tại" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); margin-left: 6px;"><i class="fas fa-search-plus me-2"></i>Quét trang này</button>
-<button class="multi-voucher-paste-bar" id="autoScanPlatformBtn" onclick="autoScanPlatformVouchers()" title="Quét toàn bộ mã từ cổng Voucher Portal Shopee" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); margin-left: 6px;"><i class="fas fa-globe me-2"></i>Quét toàn sàn</button>
+<button class="multi-voucher-paste-bar" id="autoScanPlatformBtn" onclick="autoScanPlatformVouchers()" title="Quét toàn bộ mã voucher từ các shop hot toàn sàn" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); margin-left: 6px;"><i class="fas fa-globe me-2"></i>Quét toàn sàn</button>
 
                                         </div>
 
@@ -10942,117 +10942,113 @@
       }
     }
 
-    // Auto-scan entire Shopee platform vouchers via recommended microsite API
+    // Auto-scan entire Shopee platform shop vouchers (Trending shops)
     async function autoScanPlatformVouchers() {
       const btn = document.getElementById("autoScanPlatformBtn");
       if (btn) {
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang tải dữ liệu...';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Đang tìm Shop...';
         btn.disabled = true;
       }
       try {
         const csrfToken = getFallbackCsrfToken();
-        const pageUrls = ["ma-giam-gia"];
-        let allVoucherCodes = [];
         
-        for (const pageUrl of pageUrls) {
-          // 1. Fetch page layout builder data
-          const csrUrl = `https://shopee.vn/api/v4/pagebuilder/get_csr_page?page_url=${encodeURIComponent(pageUrl)}&platform=4&timestamp=0`;
-          const pageResponse = await fetch(csrUrl, {
-            method: "GET",
-            headers: {
-              accept: "application/json",
-              "accept-language": "vi",
-            },
-            credentials: "include",
-          });
-          const pageData = await pageResponse.json();
-          if (pageData.error !== 0 || !pageData.layout) continue;
-          
-          // 2. Parse collections from layout response
-          let voucherCollections = [];
-          if (pageData.layout && pageData.layout.component_list) {
-            for (const component of pageData.layout.component_list) {
-              const component_id = component.id;
-              const properties = component.properties;
-              try {
-                const propertiesDecoded = JSON.parse(properties);
-                if (Array.isArray(propertiesDecoded)) {
-                  for (const property of propertiesDecoded) {
-                    if (property.key === "data" && property.value?.voucher_collection_id) {
-                      voucherCollections.push({
-                        collection_id: property.value.voucher_collection_id,
-                        component_id: component_id,
-                      });
-                    }
-                  }
+        // 1. Fetch trending items from homepage recommendation API to extract active Shop IDs
+        // Fetching 60 items covers a broad range of active sellers
+        const recUrl = "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60";
+        const recResponse = await fetch(recUrl, {
+          headers: {
+            accept: "application/json",
+            "x-csrftoken": csrfToken,
+          },
+          credentials: "include",
+        });
+        const recData = await recResponse.json();
+        
+        let shopIds = new Set();
+        if (recData.data && Array.isArray(recData.data.sections)) {
+          recData.data.sections.forEach(sec => {
+            if (sec.data && Array.isArray(sec.data.item)) {
+              sec.data.item.forEach(item => {
+                if (item.shopid) {
+                  shopIds.add(item.shopid);
                 }
-              } catch {}
+              });
             }
-          }
-          if (!voucherCollections.length) continue;
-          
-          // 3. Batch request actual voucher details from microsite collections API
-          const requestList = voucherCollections.map((item) => ({
-            collection_id: item.collection_id.toString(),
-            component_type: 1,
-            component_id: item.component_id,
-            limit: 50,
-            microsite_id: 66938,
-            offset: 0,
-            number_of_vouchers_per_row: 1,
-          }));
-          
-          const detailResponse = await fetch(
-            "https://shopee.vn/api/v1/microsite/get_vouchers_by_collections",
-            {
-              method: "POST",
-              headers: {
-                accept: "application/json",
-                "accept-language": "en-US,en;q=0.9,vi;q=0.8",
-                "content-type": "application/json",
-                "x-csrftoken": csrfToken,
-              },
-              body: JSON.stringify({
-                voucher_collection_request_list: requestList,
-              }),
-              credentials: "include",
-            }
-          );
-          const detailData = await detailResponse.json();
-          if (detailData.data && Array.isArray(detailData.data)) {
-            detailData.data.forEach((collection) => {
-              if (collection.vouchers && Array.isArray(collection.vouchers)) {
-                collection.vouchers.forEach((voucherItem) => {
-                  const voucher = voucherItem.voucher;
-                  if (voucher && voucher.voucher_identifier && voucher.voucher_identifier.voucher_code) {
-                    allVoucherCodes.push(voucher.voucher_identifier.voucher_code);
-                  }
-                });
-              }
-            });
-          }
+          });
         }
         
-        // 4. Fill input and start auto-saving!
+        const uniqueShopIds = Array.from(shopIds);
+        console.log(`Tìm thấy ${uniqueShopIds.length} shop bán chạy.`);
+        
+        if (uniqueShopIds.length === 0) {
+          alert("Không tìm thấy Shop bán chạy nào từ trang gợi ý. Vui lòng thử lại!");
+          if (btn) {
+            btn.innerHTML = '<i class="fas fa-globe me-2"></i>Quét toàn sàn';
+            btn.disabled = false;
+          }
+          return;
+        }
+        
+        // 2. Fetch vouchers for each Shop ID
+        let allVoucherCodes = [];
+        let processedShops = 0;
+        
+        for (const shopId of uniqueShopIds) {
+          if (btn) {
+            btn.innerHTML = `<i class="fas fa-spinner fa-spin me-2"></i>Quét Shop ${processedShops + 1}/${uniqueShopIds.length}...`;
+          }
+          
+          try {
+            const voucherUrl = `https://shopee.vn/api/v2/voucher_wallet/get_shop_vouchers_by_shopid?shop_id=${shopId}`;
+            const vResponse = await fetch(voucherUrl, {
+              headers: {
+                accept: "application/json",
+                "x-csrftoken": csrfToken,
+              },
+              credentials: "include",
+            });
+            const vData = await vResponse.json();
+            
+            if (vData.error === 0 && vData.data && Array.isArray(vData.data.vouchers)) {
+              vData.data.vouchers.forEach(v => {
+                if (v.voucher_code) {
+                  allVoucherCodes.push(v.voucher_code);
+                }
+              });
+            }
+          } catch (err) {
+            console.error(`Lỗi khi lấy voucher của shop ${shopId}:`, err);
+          }
+          
+          processedShops++;
+          // Sleep tiny bit (100ms) to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        // 3. Fill input field and trigger saving
         const inputField = document.getElementById("multiVoucherInput");
         if (inputField && allVoucherCodes.length) {
           const uniqueCodes = Array.from(new Set(allVoucherCodes));
           const joinedCodes = uniqueCodes.join("\n");
           inputField.value = joinedCodes;
+          
+          if (btn) {
+            btn.innerHTML = `<i class="fas fa-check me-2"></i>Tìm thấy ${uniqueCodes.length} mã!`;
+          }
+          
           await processMultiVoucherInput(joinedCodes.trim());
         } else {
-          alert("Không tìm thấy mã giảm giá nào trên cổng voucher portal!");
+          alert("Không tìm thấy mã giảm giá shop nào đang phát hành!");
         }
         
         if (btn) {
-          btn.innerHTML = '<i class="fas fa-check me-2"></i>Quét xong toàn sàn!';
           setTimeout(() => {
             btn.innerHTML = '<i class="fas fa-globe me-2"></i>Quét toàn sàn';
             btn.disabled = false;
-          }, 2000);
+          }, 3000);
         }
       } catch (err) {
-        console.error("Lỗi quét toàn sàn:", err);
+        console.error("Lỗi quét toàn sàn shop:", err);
         if (btn) {
           btn.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>Lỗi quét sàn';
           btn.disabled = false;
