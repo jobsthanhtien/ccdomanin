@@ -10951,9 +10951,9 @@
       }
       try {
         const csrfToken = getFallbackCsrfToken();
+        const apiSource = typeof getApiSourceHeaderValue === "function" ? getApiSourceHeaderValue() : "pc";
         
         // 1. Fetch from multiple trending bundles (Discover offset 0, offset 60, and Flash Sale)
-        // This yields a much broader, platform-wide coverage of active shop IDs!
         const recUrls = [
           "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60&offset=0",
           "https://shopee.vn/api/v4/recommend/recommend?bundle=daily_discover_main&limit=60&offset=60",
@@ -10968,6 +10968,8 @@
               headers: {
                 accept: "application/json",
                 "x-csrftoken": csrfToken,
+                "x-requested-with": "XMLHttpRequest",
+                "x-api-source": apiSource,
               },
               credentials: "include",
             });
@@ -11010,12 +11012,15 @@
           }
           
           try {
-            // Note: shopid param (without underscore) is the correct parameters for this endpoint!
             const voucherUrl = `https://shopee.vn/api/v2/voucher_wallet/get_shop_vouchers_by_shopid?shopid=${shopId}`;
+            // We pass the full set of client headers to authenticate and authorize the API request
             const vResponse = await fetch(voucherUrl, {
               headers: {
-                accept: "application/json",
+                "accept": "application/json",
+                "content-type": "application/json",
                 "x-csrftoken": csrfToken,
+                "x-requested-with": "XMLHttpRequest",
+                "x-api-source": apiSource,
               },
               credentials: "include",
             });
@@ -11033,8 +11038,8 @@
           }
           
           processedShops++;
-          // Sleep tiny bit (80ms) to avoid rate limits
-          await new Promise(resolve => setTimeout(resolve, 80));
+          // Sleep tiny bit (100ms) to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
         
         // 3. Fill input field and trigger saving
