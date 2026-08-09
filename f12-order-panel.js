@@ -20,6 +20,14 @@
   const STORE_FRONT = `${API_ROOT}/store-front`;
   const CUSTOMER_API = `${API_ROOT}/customer-api`;
   const API_TIMEOUT_MS = 8000;
+  const CHECKOUT_PROBE_MAX_AGE_MS = 120000;
+  const CHECKOUT_WARMUP_SECONDS = 30;
+  const SLOW_REQUEST_THRESHOLD_MS = 750;
+  const WALLET_VOUCHER_REFRESH_MS = 5000;
+  const VOUCHER_APPLY_RETRY_MS = 3000;
+  const ENSURE_TARGET_SKU = "00503063";
+  const ENSURE_TARGET_UNIT = "thung";
+  const ENSURE_TARGET_PRICE_VND = 912000;
 
   const PAYMENT_LABELS = Object.freeze({
     cash_on_delivery: "Thanh toán tiền mặt khi nhận hàng",
@@ -59,6 +67,14 @@
     ordersCreated: 0,
     priceChecksUsed: 0,
     precheckCompleted: false,
+    targetCheckoutRefreshed: false,
+    checkoutProbe: null,
+    walletVoucherCodes: [],
+    walletVoucherFetchedAt: 0,
+    lastWalletVoucherError: "",
+    lastVoucherStatusSignature: "",
+    lastCheckoutContextSignature: "",
+    lastSlowRequestLogAt: {},
     settings: {
       startTime: "08:00:00",
       precheckSeconds: 2,
@@ -67,6 +83,8 @@
       totalAttempts: 3600,
       orderCopies: 3,
       paymentMethod: "momo",
+      autoApplyWalletVouchers: true,
+      voucherCodes: [],
       submitRealOrders: false,
       maxExtraPerOrderVnd: 150000,
     },
@@ -101,7 +119,11 @@
     });
   }
 
-  async function fetchWithTimeout(url, options = {}, timeoutMs = API_TIMEOUT_MS) {
+  async function fetchTextWithTimeout(
+    url,
+    options = {},
+    timeoutMs = API_TIMEOUT_MS,
+  ) {
     const controller = new AbortController();
     const upstreamSignal = options.signal;
     const onUpstreamAbort = () => controller.abort(upstreamSignal.reason);
@@ -114,10 +136,12 @@
     }
     const timer = setTimeout(() => controller.abort("request-timeout"), timeoutMs);
     try {
-      return await fetch(url, {
+      const response = await fetch(url, {
         ...options,
         signal: controller.signal,
       });
+      const text = await response.text();
+      return { response, text };
     } catch (cause) {
       if (
         controller.signal.aborted &&
@@ -137,6 +161,12 @@
 
   function fail(message) {
     throw new Error(message);
+  }
+
+  function failPolicy(message, fatal = false) {
+    const error = new Error(message);
+    error.fatalPolicy = fatal;
+    throw error;
   }
 
   function normalizeText(value) {
@@ -355,8 +385,11 @@
           <section data-lc-page="settings" hidden>
             <div class="lc-note">
               Bot chỉ gửi request API. Không mở giỏ, không mở tab worker, không
-              tự chuyển trang. Mã đơn/link thanh toán sẽ hiện trong bảng để bạn
-              tự mở và thanh toán sau.
+              tự chuyển trang. Bot tạo checkout hoàn chỉnh với địa chỉ, giao
+              hàng và ưu đãi/voucher rồi mới so giá cuối; mã đơn/link thanh toán
+              sẽ hiện trong bảng để bạn tự mở và thanh toán sau. Bot không phụ
+              thuộc nút “Mua/Gọi tư vấn viên” đang hiển thị trên giao diện,
+              nhưng sẽ dừng nếu backend thật sự trả về yêu cầu tư vấn dược sĩ.
             </div>
             <div class="lc-grid">
               <label>Giờ bắt đầu
@@ -375,7 +408,7 @@
               </label>
               <label>Tổng số lần thử
                 <input id="${ROOT_ID}-attempts" type="number" min="1" max="100000" value="3600" />
-                <small>Tổng lượt request kiểm tra giá trước khi dừng.</small>
+                <small>Tổng lượt request kiểm tra giá checkout trước khi dừng.</small>
               </label>
               <label>Số đơn giống nhau
                 <input id="${ROOT_ID}-copies" type="number" min="1" max="20" value="3" />
@@ -391,17 +424,26 @@
                   <option value="cash_on_delivery">Tiền mặt khi nhận hàng</option>
                 </select>
               </label>
-              <label>Phần chênh tối đa mỗi đơn (VND)
+              <label>Mã voucher cố định (không bắt buộc)
+                <input id="${ROOT_ID}-voucher" placeholder="Mã1, Mã2" />
+                <small>Nhiều mã cách nhau bằng dấu phẩy.</small>
+              </label>
+              <label style="display:flex;align-items:center;gap:8px;margin-top:18px">
+                <input id="${ROOT_ID}-wallet-vouchers" type="checkbox" checked style="width:auto;margin:0" />
+                Tự thử voucher hợp lệ trong ví
+              </label>
+              <label>Phí giao/phụ phí tối đa mỗi đơn (VND)
                 <input id="${ROOT_ID}-extra" type="number" min="0" value="150000" />
+                <small>Không làm tăng trần giá hàng; chỉ giới hạn khoản ngoài tiền sản phẩm.</small>
               </label>
               <label style="display:flex;align-items:center;gap:8px;margin-top:18px">
                 <input id="${ROOT_ID}-submit" type="checkbox" style="width:auto;margin:0" />
                 CHO PHÉP TẠO ĐƠN THẬT
               </label>
               <div class="lc-note">
-                Bỏ chọn: chỉ canh giờ, kiểm tra giá và tài khoản, không tạo giỏ
-                hoặc đơn. Bật chọn: khi đúng giờ và đúng giá, bot sẽ gửi API
-                checkout và tạo số đơn thật đã cấu hình.
+                Bỏ chọn: tạo checkout thử để đọc giá cuối sau ưu đãi nhưng không
+                tạo đơn. Bật chọn: khi đúng giờ và tổng giá hàng checkout không
+                vượt giá trần, bot sẽ gửi API tạo số đơn thật đã cấu hình.
               </div>
             </div>
           </section>
@@ -461,6 +503,15 @@
         document.getElementById(`${ROOT_ID}-copies`).value,
       ),
       paymentMethod: document.getElementById(`${ROOT_ID}-payment`).value,
+      autoApplyWalletVouchers: document.getElementById(
+        `${ROOT_ID}-wallet-vouchers`,
+      ).checked,
+      voucherCodes: document
+        .getElementById(`${ROOT_ID}-voucher`)
+        .value.split(",")
+        .map((value) => value.trim().toUpperCase())
+        .filter(Boolean)
+        .filter((value, index, values) => values.indexOf(value) === index),
       submitRealOrders: document.getElementById(`${ROOT_ID}-submit`).checked,
       maxExtraPerOrderVnd: Number(
         document.getElementById(`${ROOT_ID}-extra`).value,
@@ -515,10 +566,16 @@
       fail("Tổng số lần thử chỉ được từ 1 đến 100000.");
     }
     if (
+      settings.voucherCodes.length > 10 ||
+      settings.voucherCodes.some((code) => code.length > 64)
+    ) {
+      fail("Chỉ nhập tối đa 10 mã voucher, mỗi mã không quá 64 ký tự.");
+    }
+    if (
       !Number.isFinite(settings.maxExtraPerOrderVnd) ||
       settings.maxExtraPerOrderVnd < 0
     ) {
-      fail("Phần chênh tối đa không hợp lệ.");
+      fail("Phí giao/phụ phí tối đa không hợp lệ.");
     }
     return settings;
   }
@@ -550,6 +607,7 @@
     if (Array.isArray(unwrapped?.items)) return unwrapped.items;
     if (Array.isArray(unwrapped?.results)) return unwrapped.results;
     if (Array.isArray(unwrapped?.addresses)) return unwrapped.addresses;
+    if (Array.isArray(unwrapped?.vouchers)) return unwrapped.vouchers;
     return [];
   }
 
@@ -580,15 +638,40 @@
       headers.Authorization = `Bearer ${token.replace(/^Bearer\s+/i, "")}`;
     }
     if (!silent) appendLog(`[API] ${method} ${url.pathname}`);
-    const response = await fetchWithTimeout(url, {
-      method,
-      credentials: "include",
-      cache: "no-store",
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: state.running ? state.abortController?.signal : undefined,
-    });
-    const text = await response.text();
+    const requestStartedAt = Date.now();
+    let response;
+    let text;
+    try {
+      ({ response, text } = await fetchTextWithTimeout(url, {
+        method,
+        credentials: "include",
+        cache: "no-store",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: state.running ? state.abortController?.signal : undefined,
+      }));
+    } catch (error) {
+      const elapsedMs = Date.now() - requestStartedAt;
+      if (!state.stopped) {
+        appendLog(
+          `[API lỗi/chậm] ${method} ${url.pathname}: ${elapsedMs}ms — ${error.message}`,
+          "warn",
+        );
+      }
+      throw error;
+    }
+    const elapsedMs = Date.now() - requestStartedAt;
+    if (elapsedMs >= SLOW_REQUEST_THRESHOLD_MS) {
+      const metricKey = `${method} ${url.pathname}`;
+      const now = Date.now();
+      if (now - Number(state.lastSlowRequestLogAt[metricKey] || 0) >= 5000) {
+        state.lastSlowRequestLogAt[metricKey] = now;
+        appendLog(
+          `[API chậm] ${metricKey}: ${elapsedMs}ms (HTTP ${response.status}).`,
+          "warn",
+        );
+      }
+    }
     let payload = null;
     try {
       payload = text ? JSON.parse(text) : null;
@@ -609,6 +692,11 @@
       const retryAfterSeconds = Number(retryAfter);
       if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
         error.retryAfterMs = retryAfterSeconds * 1000;
+      } else if (retryAfter) {
+        const retryAt = Date.parse(retryAfter);
+        if (Number.isFinite(retryAt)) {
+          error.retryAfterMs = Math.max(0, retryAt - Date.now());
+        }
       }
       throw error;
     }
@@ -629,6 +717,22 @@
       return null;
     }
     return webpackRequire;
+  }
+
+  function getVoucherApi() {
+    const webpackRequire = getWebpackRequire();
+    if (!webpackRequire) return null;
+    try {
+      const knownModule = webpackRequire(37474);
+      if (knownModule?.D$ && knownModule?.uZ) return knownModule;
+    } catch {
+      // Tìm theo exports nếu mã module thay đổi ở bản build mới.
+    }
+    for (const moduleRecord of Object.values(webpackRequire.c || {})) {
+      const candidate = moduleRecord?.exports;
+      if (candidate?.D$ && candidate?.uZ) return candidate;
+    }
+    return null;
   }
 
   async function loadAccount() {
@@ -710,7 +814,10 @@
       );
     }
 
-    appendLog("Đã xác nhận tài khoản và địa chỉ mặc định.", "ok");
+    appendLog(
+      `Đã xác nhận tài khoản ****${phone.slice(-4)} và địa chỉ mặc định.`,
+      "ok",
+    );
     return {
       customer,
       address,
@@ -730,7 +837,7 @@
       fail("URL phải là trang chi tiết sản phẩm Long Châu.");
     }
     url.searchParams.set("_lc_request_panel", String(Date.now()));
-    const response = await fetchWithTimeout(url, {
+    const { response, text: html } = await fetchTextWithTimeout(url, {
       credentials: "include",
       cache: "no-store",
       headers: { Accept: "text/html" },
@@ -738,7 +845,6 @@
     if (!response.ok) {
       fail(`Không đọc được sản phẩm: HTTP ${response.status}.`);
     }
-    const html = await response.text();
     const doc = new DOMParser().parseFromString(html, "text/html");
     const dataText = doc.getElementById("__NEXT_DATA__")?.textContent;
     if (!dataText) fail("Trang không trả về dữ liệu sản phẩm.");
@@ -824,14 +930,21 @@
     detail.appendChild(createElement("div", "", "Chọn đơn vị tính"));
     const units = createElement("div", "lc-units");
     for (const unit of product.units) {
+      const isBlockedEnsureUnit =
+        product.sku === ENSURE_TARGET_SKU &&
+        normalizeText(unit.label) !== ENSURE_TARGET_UNIT;
       const button = createElement(
         "button",
         `lc-unit${unit.code === state.selectedUnitCode ? " is-selected" : ""}`,
         `${unit.label} — ${formatVnd(unit.finalPrice)}`,
       );
       button.type = "button";
-      button.disabled = !unit.inStock;
-      button.title = unit.specification;
+      button.disabled = isBlockedEnsureUnit;
+      button.title = isBlockedEnsureUnit
+        ? "Cấu hình Ensure này chỉ cho phép đơn vị Thùng."
+        : unit.inStock
+          ? unit.specification
+          : `${unit.specification} — đang hết hàng, vẫn có thể cấu hình để canh lại kho.`;
       button.addEventListener("click", () => {
         state.selectedUnitCode = unit.code;
         renderPreview();
@@ -845,14 +958,17 @@
     );
     const fields = createElement("div", "lc-grid");
     const priceLabel = document.createElement("label");
-    priceLabel.textContent = "Chỉ mua khi giá chính xác (VND)";
+    priceLabel.textContent =
+      "Giá trần mỗi đơn vị sau ưu đãi/voucher (VND)";
     const target = document.createElement("input");
     target.id = `${ROOT_ID}-target`;
     target.type = "number";
     target.min = "1";
     target.value =
-      selected && normalizeText(selected.label) === "thung"
-        ? "912000"
+      selected &&
+      product.sku === ENSURE_TARGET_SKU &&
+      normalizeText(selected.label) === ENSURE_TARGET_UNIT
+        ? String(ENSURE_TARGET_PRICE_VND)
         : String(selected?.finalPrice ?? "");
     priceLabel.appendChild(target);
     fields.appendChild(priceLabel);
@@ -885,6 +1001,12 @@
         (entry) => entry.code === state.selectedUnitCode,
       );
       if (!product || !unit) fail("Hãy chọn sản phẩm và đơn vị.");
+      if (
+        product.sku === ENSURE_TARGET_SKU &&
+        normalizeText(unit.label) !== ENSURE_TARGET_UNIT
+      ) {
+        fail("SKU Ensure 00503063 chỉ được cấu hình với đơn vị Thùng.");
+      }
       const targetPrice = Number(
         document.getElementById(`${ROOT_ID}-target`).value,
       );
@@ -892,7 +1014,7 @@
         document.getElementById(`${ROOT_ID}-qty`).value,
       );
       if (!Number.isInteger(targetPrice) || targetPrice <= 0) {
-        fail("Giá mục tiêu phải là số nguyên VND lớn hơn 0.");
+        fail("Giá trần phải là số nguyên VND lớn hơn 0.");
       }
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
         fail("Số lượng phải từ 1 đến 99.");
@@ -914,7 +1036,7 @@
       else state.items.push(item);
       renderOrders();
       appendLog(
-        `Đã thêm ${item.unitLabel}: mục tiêu ${formatVnd(item.targetPrice)}`,
+        `Đã thêm ${item.unitLabel}: chỉ mua khi không vượt ${formatVnd(item.targetPrice)}`,
         "ok",
       );
       switchTab("order");
@@ -951,7 +1073,7 @@
         createElement(
           "div",
           "",
-          `${item.unitLabel} · ${item.quantity} × ${formatVnd(item.targetPrice)}`,
+          `${item.unitLabel} · ${item.quantity} × trần ${formatVnd(item.targetPrice)}`,
         ),
       );
       detail.appendChild(createElement("small", "", `SKU ${item.sku}`));
@@ -978,7 +1100,7 @@
       createElement(
         "strong",
         "",
-        `Tiền hàng mục tiêu mỗi đơn: ${formatVnd(total)}`,
+        `Trần tiền hàng mỗi đơn: ${formatVnd(total)}`,
       ),
     );
     host.appendChild(totalLine);
@@ -996,6 +1118,13 @@
           `Đơn ${result.number}: ${result.orderCode || "đã tạo"}`,
         ),
       );
+      if (result.warning) {
+        const warning = createElement("div", "", result.warning);
+        warning.style.color = "#b42318";
+        warning.style.fontWeight = "700";
+        warning.style.marginTop = "6px";
+        card.appendChild(warning);
+      }
       if (result.paymentUrl) {
         const link = document.createElement("a");
         link.href = result.paymentUrl;
@@ -1042,45 +1171,426 @@
     }
   }
 
-  async function requestPriceObservations() {
-    const prices = await apiJson(
-      `${STORE_FRONT}/v3/promotions/price`,
-      "POST",
-      state.items.map((item) => ({
-        itemCode: item.sku,
-        unitCode: item.unitCode,
-        price: item.listPrice,
-      })),
-      { silent: true },
+  function targetGoodsTotal() {
+    return state.items.reduce(
+      (sum, item) => sum + item.targetPrice * item.quantity,
+      0,
     );
-    const priceRows = asArray(prices);
-    return state.items.map((item) => {
-      const promotion = priceRows.find(
-        (entry) =>
-          String(entry.itemCode) === String(item.sku) &&
-          Number(entry.unitCode) === Number(item.unitCode),
+  }
+
+  function validateConfiguredOrder() {
+    const ensureItems = state.items.filter(
+      (item) => String(item.sku) === ENSURE_TARGET_SKU,
+    );
+    if (ensureItems.length === 0) return;
+    if (state.items.length !== 1 || ensureItems.length !== 1) {
+      fail(
+        "Cấu hình Ensure 00503063 phải là sản phẩm duy nhất trong mỗi đơn để kiểm tra chính xác 912.000đ/Thùng.",
       );
+    }
+    const item = ensureItems[0];
+    if (normalizeText(item.unitLabel) !== ENSURE_TARGET_UNIT) {
+      fail("SKU Ensure 00503063 chỉ được mua theo đơn vị Thùng.");
+    }
+    if (Number(item.targetPrice) !== ENSURE_TARGET_PRICE_VND) {
+      fail("Giá trần của Ensure Thùng phải là 912.000đ.");
+    }
+  }
+
+  function checkoutObservation(cart) {
+    const price = cart?.calculatorPriceInfo || {};
+    const shipmentFee = Number(price.shipmentFee ?? 0);
+    const estimatedPrice = Number(
+      price.estimatedPrice ?? price.totalBill ?? NaN,
+    );
+    const goodsTotal = estimatedPrice - shipmentFee;
+    const directDiscount = Number(price.totalDiscount ?? 0);
+    const voucherDiscount = Number(price.totalVoucherPrice ?? 0);
+    const principalAmount = Number(
+      price.principalAmount ??
+        goodsTotal + directDiscount + voucherDiscount,
+    );
+    const targetTotal = targetGoodsTotal();
+    return {
+      goodsTotal,
+      targetGoodsTotal: targetTotal,
+      shipmentFee,
+      estimatedPrice,
+      principalAmount,
+      directDiscount,
+      voucherDiscount,
+      missingDiscount: Math.max(0, goodsTotal - targetTotal),
+      effectiveUnitPrice:
+        state.items.length === 1 && Number(state.items[0]?.quantity) > 0
+          ? goodsTotal / Number(state.items[0].quantity)
+          : NaN,
+    };
+  }
+
+  function checkoutPriceAccepted(observation) {
+    return (
+      Number.isFinite(observation.goodsTotal) &&
+      observation.goodsTotal > 0 &&
+      observation.goodsTotal <= observation.targetGoodsTotal
+    );
+  }
+
+  function describeCheckout(observation, prefix = "") {
+    const unitText = Number.isFinite(observation.effectiveUnitPrice)
+      ? ` · hiệu dụng ${formatVnd(observation.effectiveUnitPrice)}/đơn vị`
+      : "";
+    const principalText = Number.isFinite(observation.principalAmount)
+      ? ` · giá gốc ${formatVnd(observation.principalAmount)}`
+      : "";
+    const missingText =
+      observation.missingDiscount > 0
+        ? ` · còn thiếu ưu đãi ${formatVnd(observation.missingDiscount)}`
+        : "";
+    return (
+      `${prefix}giá hàng sau ưu đãi ${formatVnd(observation.goodsTotal)}` +
+      ` / trần ${formatVnd(observation.targetGoodsTotal)}` +
+      unitText +
+      principalText +
+      ` · giảm trực tiếp ${formatVnd(observation.directDiscount)}` +
+      ` · voucher ${formatVnd(observation.voucherDiscount)}` +
+      missingText +
+      ` · phí giao ${formatVnd(observation.shipmentFee)}`
+    );
+  }
+
+  function checkoutSignature(observation) {
+    return [
+      observation.goodsTotal,
+      observation.principalAmount,
+      observation.directDiscount,
+      observation.voucherDiscount,
+      observation.missingDiscount,
+      observation.shipmentFee,
+    ].join("|");
+  }
+
+  function checkoutPromotionLabels(cart) {
+    const labels = [];
+    const addFrom = (value) => {
+      if (!value || typeof value !== "object") return;
+      for (const key of [
+        "promotionCode",
+        "promotionId",
+        "programCode",
+        "programId",
+        "promotionName",
+        "programName",
+        "seriesCode",
+      ]) {
+        const text = String(value[key] ?? "").trim();
+        if (text) labels.push(text);
+      }
+    };
+    for (const row of selectedProductRows(cart)) {
+      addFrom(row.detailCalculatorPriceInfo);
+      for (const promotion of row.listSuggestPromotion || []) {
+        addFrom(promotion);
+      }
+    }
+    for (const voucher of cart?.vouchers || []) addFrom(voucher);
+    return [...new Set(labels)].slice(0, 6);
+  }
+
+  function logCheckoutContext(probe) {
+    const shop = probe?.planning?.shopSender || {};
+    const shopCode =
+      shop.shopCode || shop.code || shop.id || shop.shopId || "không rõ";
+    const warehouses = [
+      ...new Set(
+        selectedProductRows(probe.cart)
+          .map((row) => row.whsCode || row.detailCalculatorPriceInfo?.whsCode)
+          .filter(Boolean),
+      ),
+    ];
+    const promotions = checkoutPromotionLabels(probe.cart);
+    const signature = JSON.stringify([shopCode, warehouses, promotions]);
+    if (signature === state.lastCheckoutContextSignature) return;
+    state.lastCheckoutContextSignature = signature;
+    appendLog(
+      `Checkout backend: shop ${shopCode}; kho ${warehouses.join(", ") || "không rõ"}; mã ưu đãi ${promotions.join(", ") || "không trả về"}.`,
+      "warn",
+    );
+  }
+
+  function walletCartItems(cart) {
+    return selectedProductRows(cart).map((entry) => {
+      const detail = entry.detailCalculatorPriceInfo || {};
+      const product = entry.productInfo || {};
       return {
-        unitLabel: item.unitLabel,
-        price: Number(promotion?.finalPrice ?? item.listPrice),
-        target: item.targetPrice,
+        price: Number(detail.price ?? 0),
+        itemCode: detail.itemCode || entry.itemCart,
+        unitCode: detail.unitCode ?? entry.unitCode,
+        quantity: detail.quantity ?? entry.quantity,
+        isPrescription: Boolean(product.isPrescription),
+        whsCode: entry.whsCode,
+        isChronic: Boolean(product.isChronicIllness),
+        categories: product.categories || [],
       };
     });
   }
 
-  function observationSignature(observations) {
-    return observations
-      .map((entry) => `${entry.unitLabel}:${entry.price}`)
-      .join("|");
+  function logVoucherStatus(cart) {
+    const vouchers = Array.isArray(cart?.vouchers) ? cart.vouchers : [];
+    const codes = [
+      ...new Set(
+        vouchers
+          .map((voucher) =>
+            String(
+              voucher?.seriesCode ||
+                voucher?.voucherCode ||
+                voucher?.code ||
+                "",
+            )
+              .trim()
+              .toUpperCase(),
+          )
+          .filter(Boolean),
+      ),
+    ];
+    const discount = Number(
+      cart?.calculatorPriceInfo?.totalVoucherPrice ?? 0,
+    );
+    const signature = JSON.stringify([codes, discount]);
+    if (signature === state.lastVoucherStatusSignature) return;
+    state.lastVoucherStatusSignature = signature;
+    if (codes.length > 0 || discount > 0) {
+      appendLog(
+        `Voucher checkout đã áp: ${codes.join(", ") || "backend không trả mã"}; giảm ${formatVnd(discount)}.`,
+        "ok",
+      );
+      return;
+    }
+    appendLog("Voucher checkout: chưa có mã nào được áp; giảm 0đ.", "warn");
   }
 
-  function describeObservations(observations, prefix = "") {
-    return `${prefix}${observations
-      .map(
-        (entry) =>
-          `${entry.unitLabel} ${formatVnd(entry.price)} / mục tiêu ${formatVnd(entry.target)}`,
-      )
-      .join(" · ")}`;
+  async function refreshWalletVoucherCodes(cart, force = false) {
+    if (!state.settings.autoApplyWalletVouchers) return [];
+    const refreshIntervalMs = Math.max(
+      state.settings.delayCheckMs,
+      WALLET_VOUCHER_REFRESH_MS,
+    );
+    if (
+      !force &&
+      Date.now() - state.walletVoucherFetchedAt < refreshIntervalMs
+    ) {
+      return state.walletVoucherCodes;
+    }
+    state.walletVoucherFetchedAt = Date.now();
+    try {
+      const response = unwrapPayload(
+        await apiJson(
+          `${STORE_FRONT}/v3/token/cart/vouchers`,
+          "POST",
+          { cartItems: walletCartItems(cart) },
+          { auth: true, silent: true },
+        ),
+      );
+      const vouchers = Array.isArray(response?.vouchers)
+        ? response.vouchers
+        : asArray(response);
+      state.walletVoucherCodes = vouchers
+        .filter((voucher) => voucher.isValidForCart === true)
+        .map((voucher) => String(voucher.seriesCode || "").trim().toUpperCase())
+        .filter(Boolean);
+      state.lastWalletVoucherError = "";
+    } catch (error) {
+      if (error.message !== state.lastWalletVoucherError) {
+        state.lastWalletVoucherError = error.message;
+        appendLog(`Không đọc được voucher trong ví: ${error.message}`, "warn");
+      }
+    }
+    return state.walletVoucherCodes;
+  }
+
+  async function applyVoucherCodes(probe, codes) {
+    const cart = probe.cart;
+    const existingVouchers = Array.isArray(cart?.vouchers)
+      ? cart.vouchers
+      : [];
+    const existingCodes = new Set(
+      existingVouchers.map((voucher) =>
+        String(voucher.seriesCode || "").trim().toUpperCase(),
+      ),
+    );
+    const pendingCodes = codes.filter((code) => !existingCodes.has(code));
+    if (pendingCodes.length === 0) return cart;
+
+    const voucherApi = getVoucherApi();
+    if (!voucherApi?.D$ || !voucherApi?.uZ) {
+      fail("Module voucher của Long Châu chưa sẵn sàng.");
+    }
+    const token = (localStorage.getItem("access_token") || "").replace(
+      /^Bearer\s+/i,
+      "",
+    );
+    if (!token) fail("Không có access token để kiểm tra voucher.");
+
+    const itemCodes = selectedProductRows(cart).map(
+      (entry) => entry.itemCart,
+    );
+    const verified = asArray(
+      await voucherApi.D$(
+        {
+          vouchers: pendingCodes.map((seriesCode) => ({
+            seriesCode,
+            shopCode: "",
+            phone: state.account.phone,
+            itemCode: itemCodes,
+          })),
+          groupVouchers: existingVouchers.map((voucher) => ({
+            seriesCode: voucher.seriesCode,
+            shopCode: "",
+            phone: state.account.phone,
+            itemCode: itemCodes,
+          })),
+        },
+        token,
+      ),
+    );
+    const voucherDetails = verified
+      .map((voucher) => voucher.detail)
+      .filter(Boolean);
+    if (voucherDetails.length === 0) return cart;
+
+    return unwrapPayload(
+      await voucherApi.uZ(
+        {
+          sessionId: probe.sessionId,
+          customerId: state.account.customer.customerId,
+          phoneNumber: state.account.phone,
+          voucherDetails,
+        },
+        token,
+      ),
+    );
+  }
+
+  async function maybeApplyVouchers(probe, forceWalletRefresh = false) {
+    const retryIntervalMs = Math.max(
+      state.settings.delayCheckMs,
+      VOUCHER_APPLY_RETRY_MS,
+    );
+    if (Date.now() < (probe.nextVoucherAttemptAt || 0)) return probe.cart;
+    probe.nextVoucherAttemptAt = Number.POSITIVE_INFINITY;
+    try {
+      const walletCodes = await refreshWalletVoucherCodes(
+        probe.cart,
+        forceWalletRefresh,
+      );
+      const codes = [
+        ...new Set([...state.settings.voucherCodes, ...walletCodes]),
+      ];
+      if (codes.length === 0) {
+        logVoucherStatus(probe.cart);
+        return probe.cart;
+      }
+      try {
+        probe.cart = await applyVoucherCodes(probe, codes);
+        probe.lastVoucherError = "";
+      } catch (error) {
+        if (error.message !== probe.lastVoucherError) {
+          probe.lastVoucherError = error.message;
+          appendLog(`Voucher chưa áp dụng được: ${error.message}`, "warn");
+        }
+      }
+      logVoucherStatus(probe.cart);
+      return probe.cart;
+    } finally {
+      probe.nextVoucherAttemptAt = Date.now() + retryIntervalMs;
+    }
+  }
+
+  async function addConfiguredItems(sessionId) {
+    for (const item of state.items) {
+      await apiJson(
+        `${STORE_FRONT}/v3/cart`,
+        "POST",
+        {
+          cartItem: {
+            itemCart: item.sku,
+            quantity: item.quantity,
+            unitCode: item.unitCode,
+          },
+          isCustomerToCart: false,
+          customerId: state.account.customer.customerId,
+          phoneNumber: state.account.phone,
+          sessionId,
+        },
+        { silent: true },
+      );
+    }
+  }
+
+  async function createCheckoutProbe() {
+    const sessionId = await createSession(true);
+    await addConfiguredItems(sessionId);
+    const probe = {
+      sessionId,
+      cart: await getCart(sessionId, state.account, 0, true),
+      planning: null,
+      provider: null,
+      paymentMethod: null,
+      createdAt: Date.now(),
+      nextVoucherAttemptAt: 0,
+      lastVoucherError: "",
+    };
+    validateCartContents(probe.cart);
+    await maybeApplyVouchers(probe, true);
+    validateCartContents(probe.cart);
+    const delivery = await planDelivery(
+      probe.cart,
+      sessionId,
+      state.account,
+      true,
+    );
+    probe.planning = delivery.planning;
+    probe.provider = delivery.provider;
+    probe.cart = await getCart(
+      sessionId,
+      state.account,
+      Number(probe.provider.feeFrt),
+      true,
+    );
+    validateCartContents(probe.cart);
+    probe.nextVoucherAttemptAt = 0;
+    await maybeApplyVouchers(probe);
+    validateCartContents(probe.cart);
+    probe.paymentMethod = await getPaymentMethod(probe.cart, true);
+    logCheckoutContext(probe);
+    return probe;
+  }
+
+  async function refreshCheckoutProbe({ applyVouchers = true } = {}) {
+    if (
+      state.checkoutProbe &&
+      Date.now() - state.checkoutProbe.createdAt >
+        CHECKOUT_PROBE_MAX_AGE_MS
+    ) {
+      appendLog("Làm mới checkout thử để tránh session/khung giao hết hạn.");
+      state.checkoutProbe = null;
+    }
+    if (!state.checkoutProbe) {
+      state.checkoutProbe = await createCheckoutProbe();
+    } else {
+      state.checkoutProbe.cart = await getCart(
+        state.checkoutProbe.sessionId,
+        state.account,
+        Number(state.checkoutProbe.provider?.feeFrt ?? 0),
+        true,
+      );
+      validateCartContents(state.checkoutProbe.cart);
+      if (applyVouchers) {
+        await maybeApplyVouchers(state.checkoutProbe);
+        validateCartContents(state.checkoutProbe.cart);
+      }
+      logCheckoutContext(state.checkoutProbe);
+    }
+    return state.checkoutProbe;
   }
 
   function retryDelayMs(error) {
@@ -1095,58 +1605,123 @@
 
   async function pollPriceGate(schedule) {
     if (!state.precheckCompleted) {
+      const warmupAt = new Date(
+        schedule.target.getTime() -
+          Math.max(
+            CHECKOUT_WARMUP_SECONDS,
+            state.settings.precheckSeconds,
+          ) *
+            1000,
+      );
+      await waitUntil(warmupAt.getTime(), "Chờ chuẩn bị checkout");
+      if (Date.now() < schedule.target.getTime()) {
+        appendLog(
+          `Chuẩn bị checkout hoàn chỉnh trước giờ ${CHECKOUT_WARMUP_SECONDS} giây; chưa gửi đơn.`,
+          "ok",
+        );
+        try {
+          await refreshCheckoutProbe();
+        } catch (error) {
+          if (error?.fatalPolicy) throw error;
+          state.checkoutProbe = null;
+          appendLog(`Chuẩn bị checkout lỗi: ${error.message}`, "warn");
+        }
+      }
       await waitUntil(schedule.precheckAt.getTime(), "Chờ lượt kiểm tra sớm");
       const canPrecheck =
         state.settings.precheckSeconds > 0 &&
         Date.now() < schedule.target.getTime();
       if (canPrecheck) {
         appendLog(
-          `Bắt đầu precheck trước giờ ${state.settings.precheckSeconds} giây. Lượt này không tính vào Tổng số lần thử.`,
+          `Bắt đầu tạo checkout thử trước giờ ${state.settings.precheckSeconds} giây. Chưa gửi đơn và lượt này không tính vào Tổng số lần thử.`,
           "ok",
         );
         try {
-          const precheck = await requestPriceObservations();
-          appendLog(describeObservations(precheck, "Precheck: "), "warn");
+          const precheck = await refreshCheckoutProbe();
+          appendLog(
+            describeCheckout(
+              checkoutObservation(precheck.cart),
+              "Precheck checkout: ",
+            ),
+            "warn",
+          );
         } catch (error) {
-          appendLog(`Precheck lỗi tạm thời: ${error.message}`, "warn");
+          state.checkoutProbe = null;
+          appendLog(`Precheck checkout lỗi: ${error.message}`, "warn");
         }
       }
       state.precheckCompleted = true;
     }
     await waitUntil(schedule.target.getTime(), "Chờ đúng giờ mua");
+    if (!state.targetCheckoutRefreshed) {
+      state.targetCheckoutRefreshed = true;
+      if (state.checkoutProbe) {
+        const warmedObservation = checkoutObservation(
+          state.checkoutProbe.cart,
+        );
+        if (!checkoutPriceAccepted(warmedObservation)) {
+          appendLog(
+            "Checkout làm nóng trước giờ chưa đạt giá mục tiêu; tạo cart session mới tại mốc mua để backend tính lại ưu đãi/voucher vừa mở.",
+            "warn",
+          );
+          state.checkoutProbe = null;
+          state.walletVoucherCodes = [];
+          state.walletVoucherFetchedAt = 0;
+          state.lastVoucherStatusSignature = "";
+        }
+      }
+    }
+    appendLog(
+      `Đã tới mốc mua; bắt đầu request giá. Checkout đã chuẩn bị được ${state.checkoutProbe ? Date.now() - state.checkoutProbe.createdAt : 0}ms.`,
+      "ok",
+    );
 
     let lastSignature = "";
     let lastError = "";
+    let lastObservation = null;
     while (state.priceChecksUsed < state.settings.totalAttempts) {
       if (state.stopped) fail("Bot đã dừng.");
       state.priceChecksUsed += 1;
       const attempt = state.priceChecksUsed;
       let delayMs = state.settings.delayCheckMs;
       try {
-        const observations = await requestPriceObservations();
-        const signature = observationSignature(observations);
+        const probe = await refreshCheckoutProbe({ applyVouchers: false });
+        let observation = checkoutObservation(probe.cart);
+        if (!checkoutPriceAccepted(observation)) {
+          await maybeApplyVouchers(probe);
+          validateCartContents(probe.cart);
+          observation = checkoutObservation(probe.cart);
+        }
+        lastObservation = observation;
+        const signature = checkoutSignature(observation);
         if (signature !== lastSignature) {
           lastSignature = signature;
-          appendLog(describeObservations(observations), "warn");
+          appendLog(describeCheckout(observation), "warn");
         }
-        const targetMatched = observations.every(
-          (entry) => entry.price === entry.target,
-        );
+        const targetMatched = checkoutPriceAccepted(observation);
         if (targetMatched) {
+          const elapsedFromTargetMs = Math.max(
+            0,
+            Date.now() - schedule.target.getTime(),
+          );
           appendLog(
-            `Tất cả giá mục tiêu đã khớp ở lần ${attempt}/${state.settings.totalAttempts}.`,
+            `Giá checkout sau ưu đãi đã đạt trần ở lần ${attempt}/${state.settings.totalAttempts}, sau ${elapsedFromTargetMs}ms từ mốc mua.`,
             "ok",
           );
-          return observations;
+          state.checkoutProbe = null;
+          return probe;
         }
-        setStatus(`Check giá ${attempt}/${state.settings.totalAttempts}`);
+        setStatus(
+          `Check checkout ${attempt}/${state.settings.totalAttempts}: ${formatVnd(observation.goodsTotal)}`,
+        );
       } catch (error) {
-        if (state.stopped) throw error;
+        if (state.stopped || error?.fatalPolicy) throw error;
+        state.checkoutProbe = null;
         delayMs = retryDelayMs(error);
         if (error.message !== lastError) {
           lastError = error.message;
           appendLog(
-            `Request giá lỗi tạm thời: ${error.message}. Chờ ${delayMs}ms.`,
+            `Checkout thử lỗi: ${error.message}. Tạo session mới sau ${delayMs}ms.`,
             "warn",
           );
         }
@@ -1155,8 +1730,11 @@
         await sleep(delayMs);
       }
     }
+    const finalDetail = lastObservation
+      ? ` Giá cuối ${formatVnd(lastObservation.goodsTotal)}, còn thiếu ưu đãi ${formatVnd(lastObservation.missingDiscount)} để đạt trần.`
+      : "";
     fail(
-      `Đã hết ${state.settings.totalAttempts} lần thử nhưng giá mục tiêu chưa khớp.`,
+      `Đã hết ${state.settings.totalAttempts} lần thử nhưng backend chưa áp đủ ưu đãi cho tài khoản này.${finalDetail}`,
     );
   }
 
@@ -1175,8 +1753,17 @@
     );
   }
 
-  function validateCartTargets(cart) {
+  function validateCartContents(cart) {
     const rows = selectedProductRows(cart);
+    const cartPolicyType = Number(cart?.policy?.cart?.type ?? 0);
+    if (![0, 1].includes(cartPolicyType)) {
+      const message =
+        cart?.policy?.cart?.message ||
+        (cartPolicyType === 2
+          ? "Backend Long Châu yêu cầu tư vấn dược sĩ."
+          : "Backend Long Châu chưa cho phép checkout.");
+      failPolicy(message, true);
+    }
     if (rows.length !== state.items.length) {
       fail(
         `Giỏ API có ${rows.length} sản phẩm được chọn, khác ${state.items.length} sản phẩm cấu hình. Bot dừng để tránh mua lẫn.`,
@@ -1194,25 +1781,42 @@
       if (Number(row.quantity) !== Number(item.quantity)) {
         fail(`Số lượng SKU ${item.sku} trong giỏ không đúng cấu hình.`);
       }
-      const livePrice = Number(
-        row.detailCalculatorPriceInfo?.priceAfterDiscount ??
-          row.detailCalculatorPriceInfo?.price ??
-          0,
-      );
-      if (livePrice !== item.targetPrice) {
-        fail(
-          `Giá giỏ của ${item.unitLabel} là ${formatVnd(livePrice)}, không còn đúng ${formatVnd(item.targetPrice)}.`,
+      const itemPolicyType = Number(row?.policy?.type ?? 0);
+      if (itemPolicyType !== 0) {
+        failPolicy(
+          row?.policy?.message ||
+            `SKU ${item.sku} đang bị giới hạn, hết kho hoặc cần tư vấn.`,
+          ![2, 5].includes(itemPolicyType),
         );
       }
     }
     return rows;
   }
 
-  async function createSession() {
+  function validateCheckoutTarget(cart) {
+    const observation = checkoutObservation(cart);
+    if (
+      !Number.isFinite(observation.goodsTotal) ||
+      observation.goodsTotal <= 0
+    ) {
+      fail("Checkout không trả về giá hàng cuối cùng hợp lệ.");
+    }
+    if (!checkoutPriceAccepted(observation)) {
+      fail(
+        `Giá checkout sau ưu đãi là ${formatVnd(observation.goodsTotal)}, vượt trần ${formatVnd(observation.targetGoodsTotal)}.`,
+      );
+    }
+    return observation;
+  }
+
+  async function createSession(silent = false) {
     const response = unwrapPayload(
-      await apiJson(`${STORE_FRONT}/v3/cart/session`, "POST", {
-        shopCode: "50001",
-      }),
+      await apiJson(
+        `${STORE_FRONT}/v3/cart/session`,
+        "POST",
+        { shopCode: "50001" },
+        { silent },
+      ),
     );
     const sessionId =
       typeof response === "string" ? response : response?.sessionId;
@@ -1220,9 +1824,15 @@
     return sessionId;
   }
 
-  async function getCart(sessionId, account, shipmentPrice = 0) {
+  async function getCart(
+    sessionId,
+    account,
+    shipmentPrice = 0,
+    silent = false,
+  ) {
     return unwrapPayload(
       await apiJson(`${STORE_FRONT}/v3/cart`, "GET", undefined, {
+        silent,
         query: {
           channelCode: 1,
           sessionId,
@@ -1287,7 +1897,7 @@
     ];
   }
 
-  async function planDelivery(cart, sessionId, account) {
+  async function planDelivery(cart, sessionId, account, silent = false) {
     const address = account.address;
     const payload = {
       product: planningProducts(cart),
@@ -1315,6 +1925,7 @@
         `${STORE_FRONT}/v3/order-promising/delivery/planning`,
         "POST",
         payload,
+        { silent },
       ),
     );
     const providers = Array.isArray(planning?.providers)
@@ -1338,7 +1949,7 @@
     return { planning, provider };
   }
 
-  async function getPaymentMethod(cart) {
+  async function getPaymentMethod(cart, silent = false) {
     const details = selectedProductRows(cart).map((entry) => {
       const detail = entry.detailCalculatorPriceInfo || {};
       return {
@@ -1355,9 +1966,12 @@
       };
     });
     const methods = asArray(
-      await apiJson(`${STORE_FRONT}/v5/payment/methods`, "POST", {
-        details,
-      }),
+      await apiJson(
+        `${STORE_FRONT}/v5/payment/methods`,
+        "POST",
+        { details },
+        { silent },
+      ),
     ).filter((entry) => entry.status !== false);
     const matchers = PAYMENT_MATCHERS[state.settings.paymentMethod] || [];
     const method = methods.find((entry) => {
@@ -1457,60 +2071,142 @@
     return payload;
   }
 
+  function mergeOrderResult(rawResult) {
+    const envelope =
+      rawResult && typeof rawResult === "object" && !Array.isArray(rawResult)
+        ? rawResult
+        : {};
+    const payload = unwrapPayload(rawResult);
+    return payload && typeof payload === "object" && !Array.isArray(payload)
+      ? { ...envelope, ...payload }
+      : { ...envelope };
+  }
+
+  function orderResponseMessages(rawResult, result) {
+    const messages = [];
+    const add = (value) => {
+      if (Array.isArray(value)) {
+        value.forEach(add);
+        return;
+      }
+      if (value && typeof value === "object") {
+        add(value.message);
+        add(value.description);
+        add(value.title);
+        return;
+      }
+      const text = String(value ?? "").trim();
+      if (text) messages.push(text);
+    };
+    for (const source of [rawResult, rawResult?.data, result]) {
+      if (!source || typeof source !== "object") continue;
+      add(source.message);
+      add(source.messages);
+      add(source.notification);
+      add(source.description);
+      add(source.errorMessage);
+    }
+    return [...new Set(messages)];
+  }
+
+  function orderNeedsManualReview(rawResult, result, messages) {
+    const sources = [rawResult, rawResult?.data, result].filter(
+      (value) => value && typeof value === "object",
+    );
+    const booleanFlags = [
+      "requiresPharmacistAdvice",
+      "requirePharmacistAdvice",
+      "needPharmacistAdvice",
+      "needsConsultation",
+      "isConsultation",
+      "isAdviceOrder",
+    ];
+    if (
+      sources.some((source) =>
+        booleanFlags.some((key) => source[key] === true),
+      )
+    ) {
+      return true;
+    }
+    const statusText = normalizeText(
+      sources
+        .flatMap((source) => [
+          source.status,
+          source.orderStatus,
+          source.state,
+          source.statusName,
+        ])
+        .filter(Boolean)
+        .join(" "),
+    );
+    const messageText = normalizeText(messages.join(" "));
+    const reviewPatterns = [
+      "tu van",
+      "duoc si",
+      "het hang",
+      "chi ban khi co chi dinh",
+      "cho xu ly thu cong",
+      "manual review",
+      "pharmacist",
+      "consultation",
+    ];
+    return reviewPatterns.some(
+      (pattern) =>
+        statusText.includes(pattern) || messageText.includes(pattern),
+    );
+  }
+
   function safePaymentUrl(result) {
-    const direct = result?.paymentLink;
-    if (typeof direct === "string" && direct.trim()) {
+    const candidates = [
+      result?.paymentLink,
+      result?.paymentUrl,
+      result?.redirectUrl,
+      result?.checkoutUrl,
+      result?.transferInfo?.paymentLink,
+      result?.transferInfo?.paymentUrl,
+    ];
+    for (const direct of candidates) {
+      if (typeof direct !== "string" || !direct.trim()) continue;
       try {
         const url = new URL(direct.trim(), BASE_URL);
         if (url.protocol === "https:") return url.href;
       } catch {
-        // Dùng đường dẫn thanh toán dự phòng ở dưới.
+        // Bỏ qua URL không hợp lệ do backend trả về.
       }
-    }
-    if (
-      state.settings.paymentMethod !== "cash_on_delivery" &&
-      result?.orderCode
-    ) {
-      return `${BASE_URL}/don-hang/thanh-toan/${encodeURIComponent(result.orderCode)}`;
     }
     return null;
   }
 
-  async function executeOrder(orderNumber) {
+  async function executeOrder(orderNumber, preparedCheckout = null) {
     appendLog(`Bắt đầu request đơn ${orderNumber}.`);
-    const sessionId = await createSession();
-    for (const item of state.items) {
-      await apiJson(`${STORE_FRONT}/v3/cart`, "POST", {
-        cartItem: {
-          itemCart: item.sku,
-          quantity: item.quantity,
-          unitCode: item.unitCode,
-        },
-        isCustomerToCart: false,
-        customerId: state.account.customer.customerId,
-        phoneNumber: state.account.phone,
-        sessionId,
-      });
+    const checkout = preparedCheckout || (await createCheckoutProbe());
+    const sessionId = checkout.sessionId;
+    let cart = checkout.cart;
+    validateCartContents(cart);
+    validateCheckoutTarget(cart);
+    let planning = checkout.planning;
+    let provider = checkout.provider;
+    if (!planning || !provider) {
+      const delivery = await planDelivery(cart, sessionId, state.account);
+      planning = delivery.planning;
+      provider = delivery.provider;
     }
-
-    let cart = await getCart(sessionId, state.account, 0);
-    validateCartTargets(cart);
-    const { planning, provider } = await planDelivery(
-      cart,
-      sessionId,
-      state.account,
-    );
     cart = await getCart(
       sessionId,
       state.account,
       Number(provider.feeFrt),
     );
-    validateCartTargets(cart);
+    validateCartContents(cart);
+    checkout.cart = cart;
+    if (!checkoutPriceAccepted(checkoutObservation(cart))) {
+      checkout.nextVoucherAttemptAt = 0;
+      await maybeApplyVouchers(checkout);
+      cart = checkout.cart;
+      validateCartContents(cart);
+    }
+    validateCheckoutTarget(cart);
 
-    const targetGoods = state.items.reduce(
-      (sum, item) => sum + item.targetPrice * item.quantity,
-      0,
-    );
+    const targetGoods = targetGoodsTotal();
     const total = Number(
       cart.calculatorPriceInfo?.estimatedPrice ??
         cart.calculatorPriceInfo?.totalBill ??
@@ -1525,7 +2221,8 @@
         `Tổng API ${formatVnd(total)} vượt trần ${formatVnd(maxTotal)}. Bot dừng.`,
       );
     }
-    const paymentMethod = await getPaymentMethod(cart);
+    const paymentMethod =
+      checkout.paymentMethod || (await getPaymentMethod(cart));
     const orderPayload = buildOrderPayload(
       cart,
       sessionId,
@@ -1549,18 +2246,54 @@
       error.cause = cause;
       throw error;
     }
-    const result = unwrapPayload(rawResult) || {};
-    if (!result.orderCode && !result.paymentLink && !result.transferInfo) {
+    const result = mergeOrderResult(rawResult);
+    const responseMessages = orderResponseMessages(rawResult, result);
+    const paymentUrl = safePaymentUrl(result);
+    if (!result.orderCode && !paymentUrl && !result.transferInfo) {
       const error = new Error(
         "API tạo đơn không trả về mã đơn/link thanh toán; dừng để tránh trùng.",
       );
       error.orderSubmissionStarted = true;
       throw error;
     }
+    const needsManualReview = orderNeedsManualReview(
+      rawResult,
+      result,
+      responseMessages,
+    );
+    const orderCode = String(result.orderCode || "").trim();
+    if (
+      orderCode &&
+      state.orderResults.some(
+        (entry) => String(entry.orderCode || "").trim() === orderCode,
+      )
+    ) {
+      const error = new Error(
+        `Backend trả lặp mã đơn ${orderCode}; bot dừng để không báo nhầm hoặc tạo thêm đơn trùng.`,
+      );
+      error.orderSubmissionStarted = true;
+      error.orderRecorded = true;
+      throw error;
+    }
+    const missingOnlinePayment =
+      state.settings.paymentMethod !== "cash_on_delivery" &&
+      !paymentUrl &&
+      !result.transferInfo;
+    const warningParts = [];
+    if (needsManualReview) {
+      warningParts.push(
+        responseMessages.join(" · ") ||
+          "Backend đánh dấu đơn cần tư vấn hoặc xử lý thủ công.",
+      );
+    }
+    if (missingOnlinePayment) {
+      warningParts.push("Backend không trả link/thông tin thanh toán online.");
+    }
     const savedResult = {
       number: orderNumber,
-      orderCode: result.orderCode || "",
-      paymentUrl: safePaymentUrl(result),
+      orderCode,
+      paymentUrl,
+      warning: warningParts.join(" "),
       raw: result,
     };
     state.orderResults.push(savedResult);
@@ -1570,11 +2303,23 @@
       `Đơn ${orderNumber} đã tạo: ${savedResult.orderCode || "không có mã hiển thị"}. Không mở tab thanh toán.`,
       "ok",
     );
+    if (warningParts.length > 0) {
+      const error = new Error(
+        `Đơn ${orderNumber} đã có mã ${savedResult.orderCode || "không rõ"} nhưng chưa sẵn sàng thanh toán: ${warningParts.join(" ")} Bot dừng các đơn tiếp theo để tránh tạo hàng loạt đơn chờ xử lý.`,
+      );
+      error.orderSubmissionStarted = true;
+      error.orderRecorded = true;
+      throw error;
+    }
     return savedResult;
   }
 
-  async function executeOrderWithRetry(orderNumber) {
+  async function executeOrderWithRetry(
+    orderNumber,
+    preparedCheckout = null,
+  ) {
     const maxAttempts = state.settings.checkoutRetries + 1;
+    let checkout = preparedCheckout;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (state.stopped) fail("Bot đã dừng.");
       try {
@@ -1584,14 +2329,19 @@
             "warn",
           );
         }
-        return await executeOrder(orderNumber);
+        const result = await executeOrder(orderNumber, checkout);
+        checkout = null;
+        return result;
       } catch (error) {
-        if (state.stopped) throw error;
+        checkout = null;
+        if (state.stopped || error?.fatalPolicy) throw error;
         if (error.orderSubmissionStarted) {
-          appendLog(
-            `Đơn ${orderNumber}: request tạo đơn đã được gửi nhưng phản hồi không chắc chắn. Không tự gửi lại để tránh trùng đơn.`,
-            "error",
-          );
+          if (!error.orderRecorded) {
+            appendLog(
+              `Đơn ${orderNumber}: request tạo đơn đã được gửi nhưng phản hồi không chắc chắn. Không tự gửi lại để tránh trùng đơn.`,
+              "error",
+            );
+          }
           throw error;
         }
         if (attempt >= maxAttempts) {
@@ -1623,9 +2373,9 @@
 
     if (!state.settings.submitRealOrders) {
       await pollPriceGate(schedule);
-      setStatus("Kiểm tra thử đạt: chưa thêm giỏ, chưa tạo đơn", "ok");
+      setStatus("Checkout thử đạt: chưa tạo đơn", "ok");
       appendLog(
-        "Chạy thử xong. Giá và tài khoản hợp lệ; chưa gửi request thêm giỏ/tạo đơn.",
+        "Chạy thử xong. Giá cuối sau ưu đãi/voucher không vượt trần; không gửi request tạo đơn.",
         "ok",
       );
       return;
@@ -1639,13 +2389,13 @@
       let completed = false;
       while (!completed) {
         if (state.stopped) fail("Bot đã dừng.");
-        await pollPriceGate(schedule);
+        const preparedCheckout = await pollPriceGate(schedule);
         setStatus(
-          `Giá đã khớp — đang checkout đơn ${orderNumber}/${state.settings.orderCopies}`,
+          `Giá checkout đã đạt trần — đang tạo đơn ${orderNumber}/${state.settings.orderCopies}`,
           "ok",
         );
         try {
-          await executeOrderWithRetry(orderNumber);
+          await executeOrderWithRetry(orderNumber, preparedCheckout);
           completed = true;
         } catch (error) {
           const canResumeWatching =
@@ -1676,6 +2426,7 @@
         fail("Đơn hàng chưa có sản phẩm.");
       }
       state.settings = readSettings();
+      validateConfiguredOrder();
       if (
         state.settings.submitRealOrders &&
         state.settings.totalAttempts < state.settings.orderCopies
@@ -1695,7 +2446,10 @@
           [
             `Sẽ gửi API tạo ${state.settings.orderCopies} đơn THẬT.`,
             productText,
+            `Trần giá hàng checkout mỗi đơn: ${formatVnd(targetGoodsTotal())}.`,
+            `Phí giao/phụ phí cho phép tối đa: ${formatVnd(state.settings.maxExtraPerOrderVnd)}.`,
             `Thanh toán: ${PAYMENT_LABELS[state.settings.paymentMethod]}.`,
+            `Voucher cố định: ${state.settings.voucherCodes.join(", ") || "không có"}; tự thử ví: ${state.settings.autoApplyWalletVouchers ? "có" : "không"}.`,
             `Check giá: ${state.settings.totalAttempts} lần, delay ${state.settings.delayCheckMs}ms, sớm ${state.settings.precheckSeconds}s.`,
             `Mỗi đơn được thử đặt lại tối đa ${state.settings.checkoutRetries} lần trước khi gửi request tạo đơn.`,
             "Bot không mở tab. Mã đơn/link thanh toán chỉ hiện trong bảng để bạn tự mở.",
@@ -1711,6 +2465,14 @@
       state.orderResults = [];
       state.priceChecksUsed = 0;
       state.precheckCompleted = false;
+      state.targetCheckoutRefreshed = false;
+      state.checkoutProbe = null;
+      state.walletVoucherCodes = [];
+      state.walletVoucherFetchedAt = 0;
+      state.lastWalletVoucherError = "";
+      state.lastVoucherStatusSignature = "";
+      state.lastCheckoutContextSignature = "";
+      state.lastSlowRequestLogAt = {};
       renderResults();
       document.getElementById(`${ROOT_ID}-start`).disabled = true;
       document.getElementById(`${ROOT_ID}-stop`).disabled = false;
@@ -1724,6 +2486,7 @@
     } finally {
       state.running = false;
       state.abortController = null;
+      state.checkoutProbe = null;
       const startButton = document.getElementById(`${ROOT_ID}-start`);
       const stopButton = document.getElementById(`${ROOT_ID}-stop`);
       if (startButton) startButton.disabled = false;
