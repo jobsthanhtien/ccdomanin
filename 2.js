@@ -129,7 +129,7 @@ if (_rCcSave && _rCcSave.checked) {
 
 /*
  * ==============================================================================
- * SHOPEE ULTRA-FAST AUTO-BUY & DEEP NETWORK OPTIMIZATION ENGINE (v3.6 - 2026)
+ * SHOPEE ULTRA-FAST AUTO-BUY & DEEP NETWORK OPTIMIZATION ENGINE (v3.7 - 2026)
  * ==============================================================================
  * 1. [NTP Server Time Sync] - Real-time Shopee Server Time & RTT Latency measurement.
  * 2. [Smart Item-Price & Shipping-Aware Ceiling Guard] - Separates Merchandise Subtotal
@@ -137,14 +137,13 @@ if (_rCcSave && _rCcSave.checked) {
  *    from shipping fees while 100% blocking full-price overshoot.
  * 3. [Web Worker Background Timer] - Zero-throttling countdown even when tab is in background.
  * 4. [TCP/TLS Pre-warming] - Pre-heats HTTP/2 TLS sockets before sale time to cut handshake latency.
- * 5. [In-Memory Self-Healing Resync] - Rebuilds fresh checkout & place_order in <200ms on cart change.
- * 6. [Web Audio Chimes] - Audible feedback for Order Success, Captcha, and Price Violations.
+ * 5. [Web Audio Chimes] - Audible feedback for Order Success, Captcha, and Price Violations.
  * ==============================================================================
  */
 ; (() => {
   "use strict";
 
-  const installFlag = "__SHOPEE_ULTRA_SPEED_ENGINE_V36__";
+  const installFlag = "__SHOPEE_ULTRA_SPEED_ENGINE_V37__";
   if (window[installFlag] || typeof window.fetch !== "function") return;
   window[installFlag] = true;
 
@@ -159,13 +158,7 @@ if (_rCcSave && _rCcSave.checked) {
   const nativeFetch = window.fetch.bind(window);
   const checkoutPath = "/api/v4/checkout/get";
   const placeOrderPath = "/api/v4/checkout/place_order";
-  const cartGetUrl = "https://shopee.vn/api/v4/cart/get";
-  const addToCartUrl = "https://shopee.vn/api/v4/cart/add_to_cart";
   const pdpPingUrl = "https://shopee.vn/api/v4/pdp/get_pc";
-  const minimumSyncIntervalMs = 120;
-
-  let lastSyncAt = 0;
-  let activeSync = null;
 
   // --- Logger Helper ---
   const writeLog = (message, level = "info") => {
@@ -235,7 +228,7 @@ if (_rCcSave && _rCcSave.checked) {
     try {
       const headers = { "x-shopee-language": "vi" };
       await Promise.allSettled([
-        nativeFetch(cartGetUrl, { method: "HEAD", cache: "no-store", headers, keepalive: true }),
+        nativeFetch(pdpPingUrl, { method: "HEAD", cache: "no-store", headers, keepalive: true }),
         nativeFetch(checkoutPath, { method: "HEAD", cache: "no-store", headers, keepalive: true }),
         nativeFetch(placeOrderPath, { method: "HEAD", cache: "no-store", headers, keepalive: true })
       ]);
@@ -356,13 +349,22 @@ if (_rCcSave && _rCcSave.checked) {
         window.shopeeAutoOrderSettings.isRunning = false;
       }
       const stopButtons = document.querySelectorAll(
-        "#autobuy-stop-btn, .autobuy-stop-btn, [data-action='stop-autobuy']"
+        "#autobuy-stop-btn, .autobuy-stop-btn, [data-action='stop-autobuy'], #btn-stop-autobuy"
       );
       stopButtons.forEach((btn) => btn.click && btn.click());
     } catch (_) { }
   };
 
-  // --- Helpers for Interception & Refresh ---
+  const isAutoBuyActive = () => {
+    try {
+      const stopBtn = document.getElementById("btn-stop-autobuy");
+      if (stopBtn && stopBtn.style.display !== "none") return true;
+      if (window.shopeeAutoOrderSettings && window.shopeeAutoOrderSettings.isRunning) return true;
+    } catch (_) { }
+    return false;
+  };
+
+  // --- Helpers for Interception ---
   const getUrl = (input) => {
     if (typeof input === "string") return input;
     if (input && typeof input.url === "string") return input.url;
@@ -388,205 +390,20 @@ if (_rCcSave && _rCcSave.checked) {
     }
   };
 
-  const normalizeText = (value) =>
-    String(value || "")
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[đĐ]/g, "d")
-      .toLowerCase();
-
-  const isCartRefreshError = (payload) => {
-    if (!payload) return false;
-    if (typeof payload.error === "number" && payload.error !== 0) {
-      const msg = normalizeText(payload.error_msg || payload.message || "");
-      if (
-        msg.includes("cap nhat") ||
-        msg.includes("trong") ||
-        msg.includes("empty") ||
-        msg.includes("change") ||
-        msg.includes("update") ||
-        msg.includes("gio hang") ||
-        msg.includes("cart") ||
-        msg.includes("ton kho") ||
-        msg.includes("stock") ||
-        msg.includes("gia") ||
-        msg.includes("price") ||
-        msg.includes("thu lai") ||
-        msg.includes("retry")
-      ) {
-        return true;
-      }
-    }
-    const text = normalizeText(JSON.stringify(payload || {}));
-    return (
-      text.includes("mot so san pham trong gio hang vua duoc cap nhat") ||
-      text.includes("gio hang cua ban dang trong") ||
-      text.includes("cart is empty") ||
-      text.includes("cart item") ||
-      text.includes("san pham trong gio hang da thay doi") ||
-      text.includes("price has changed") ||
-      text.includes("item has been updated") ||
-      (text.includes("cart") &&
-        (text.includes("updated") ||
-          text.includes("changed") ||
-          text.includes("empty") ||
-          text.includes("invalid")))
-    );
-  };
-
-  const copyRequestHeaders = (input, init) => {
-    const source =
-      (init && init.headers) ||
-      (typeof Request !== "undefined" && input instanceof Request
-        ? input.headers
-        : undefined);
-    const headers = new Headers(source || {});
-
-    if (!headers.has("content-type")) {
-      headers.set("content-type", "application/json");
-    }
-    if (!headers.has("x-shopee-language")) {
-      headers.set("x-shopee-language", "vi");
-    }
-    return headers;
-  };
-
-  const collectCheckoutItems = (checkoutBody) => {
-    const unique = new Map();
-    const shoporders = Array.isArray(checkoutBody && checkoutBody.shoporders)
-      ? checkoutBody.shoporders
-      : [];
-
-    for (const shoporder of shoporders) {
-      const shopid = Number(
-        (shoporder && shoporder.shop && shoporder.shop.shopid) ||
-        (shoporder && shoporder.shopid) ||
-        0
-      );
-      const items = Array.isArray(shoporder && shoporder.items)
-        ? shoporder.items
-        : [];
-
-      for (const item of items) {
-        const itemid = Number(item && item.itemid);
-        const modelid = Number(item && item.modelid);
-        if (!shopid || !itemid || !modelid) continue;
-
-        const key = `${shopid}:${itemid}:${modelid}`;
-        unique.set(key, {
-          shopid,
-          itemid,
-          modelid,
-          quantity: Math.max(1, Number(item.quantity) || 1),
-          add_on_deal_id: Number(item.add_on_deal_id) || 0,
-          is_add_on_sub_item: item.is_add_on_sub_item === true,
-          item_group_id: item.item_group_id || null,
-        });
-      }
-    }
-
-    return Array.from(unique.values());
-  };
-
-  const refreshCartState = async (checkoutBody, input, init) => {
-    const headers = copyRequestHeaders(input, init);
-    const requestOptions = {
-      method: "POST",
-      headers,
-      mode: "cors",
-      credentials: (init && init.credentials) || "include",
-      keepalive: true
-    };
-
-    let cartWasRefreshed = false;
-    try {
-      const cartResponse = await nativeFetch(cartGetUrl, {
-        ...requestOptions,
-        body: JSON.stringify({
-          pre_selected_item_list: [],
-          updated_time_filter: { start_time: 0 },
-          cart_state: {},
-          version_list: [10040779],
-        }),
-      });
-      cartWasRefreshed = cartResponse.ok;
-    } catch (error) {
-      writeLog(`Không tải lại được giỏ: ${error.message}`, "warn");
-    }
-
-    const items = collectCheckoutItems(checkoutBody);
-
-    // Parallel multi-item sync for maximum checkout speed
-    const syncTasks = items
-      .filter((item) => !item.is_add_on_sub_item)
-      .map(async (item) => {
-        const syncPayload = {
-          quantity: item.quantity,
-          checkout: true,
-          update_checkout_only: true,
-          donot_add_quantity: true,
-          source: { refer_urls: [] },
-          client_source: 1,
-          cart_client_id: 2,
-          shopid: item.shopid,
-          itemid: item.itemid,
-          modelid: item.modelid,
-        };
-
-        if (item.add_on_deal_id) {
-          syncPayload.add_on_deal_id = item.add_on_deal_id;
-          syncPayload.item_group_id = item.item_group_id;
-        }
-
-        try {
-          const syncResponse = await nativeFetch(addToCartUrl, {
-            ...requestOptions,
-            body: JSON.stringify(syncPayload),
-          });
-          const syncResult = await syncResponse.clone().json().catch(() => null);
-          return (
-            syncResponse.ok &&
-            (!syncResult || !syncResult.error || Number(syncResult.error) === 0)
-          );
-        } catch (_) {
-          return false;
-        }
-      });
-
-    const syncResults = await Promise.allSettled(syncTasks);
-    const syncedCount = syncResults.filter((r) => r.status === "fulfilled" && r.value).length;
-
-    return cartWasRefreshed || syncedCount > 0;
-  };
-
-  const ensureFreshCart = async (checkoutBody, input, init) => {
-    if (activeSync) return activeSync;
-
-    const now = Date.now();
-    if (now - lastSyncAt < minimumSyncIntervalMs) return false;
-    lastSyncAt = now;
-
-    activeSync = refreshCartState(checkoutBody, input, init).finally(() => {
-      activeSync = null;
-    });
-    return activeSync;
-  };
-
-  // Pre-sync cart items helper
-  window.__preSyncCartItems__ = async (checkoutBody, input, init) => {
-    return ensureFreshCart(checkoutBody, input, init);
-  };
-
-  // --- Fetch Interceptor with In-Memory Fast Recovery & Smart Price Guard ---
+  // --- Safe Fetch Interceptor: ONLY intercepts during active auto-buy and safeguards price ceiling ---
   window.fetch = async function cartRefreshAwareFetch(input, init) {
+    // If auto-buy is NOT active (user is simply browsing/configuring UI), bypass completely
+    if (!isAutoBuyActive()) {
+      return nativeFetch(input, init);
+    }
+
     const urlStr = getUrl(input);
 
     // [GUARD 1]: Before place_order request is sent, verify itemPrice vs maxBuyPrice
     if (urlStr.includes(placeOrderPath)) {
       const placeBody = parseJsonBody(init);
       if (placeBody && window.maxBuyPrice && window.maxBuyPrice > 0) {
-        const { itemPriceVND, totalPayableVND, shippingFeeVND } = extractOrderPrices(placeBody);
-        // Check if the item merchandise price itself exceeds maxBuyPrice
+        const { itemPriceVND } = extractOrderPrices(placeBody);
         if (itemPriceVND > window.maxBuyPrice) {
           writeLog(
             `🚨 [CHẶN GIÁ TRẦN] Tiền hàng sản phẩm (${itemPriceVND.toLocaleString("vi-VN")}đ, chưa ship) VƯỢT QUÁ giá tối đa (${window.maxBuyPrice.toLocaleString("vi-VN")}đ). ĐÃ TỰ ĐỘNG HỦY ĐẶT ĐƠN!`,
@@ -608,9 +425,6 @@ if (_rCcSave && _rCcSave.checked) {
     const response = await nativeFetch(input, init);
     if (!isCheckoutRequest(input)) return response;
 
-    const checkoutBody = parseJsonBody(init);
-    if (!checkoutBody) return response;
-
     let responseBody;
     try {
       responseBody = await response.clone().json();
@@ -618,11 +432,10 @@ if (_rCcSave && _rCcSave.checked) {
       return response;
     }
 
-    // [GUARD 2]: When checkout/get returns data, verify actual itemPrice vs maxBuyPrice
+    // [GUARD 2]: When checkout/get returns data during active auto-buy, verify actual itemPrice vs maxBuyPrice
     if (urlStr.includes(checkoutPath) && response.ok && responseBody && (!responseBody.error || Number(responseBody.error) === 0)) {
       const { itemPriceVND, totalPayableVND, shippingFeeVND } = extractOrderPrices(responseBody);
 
-      // Log clear breakdown for user transparency
       writeLog(
         `[Chi tiết giá] Tiền hàng: ${itemPriceVND.toLocaleString("vi-VN")}đ | Phí ship: ${shippingFeeVND.toLocaleString("vi-VN")}đ | Tổng thanh toán: ${totalPayableVND.toLocaleString("vi-VN")}đ`,
         "info"
@@ -658,94 +471,8 @@ if (_rCcSave && _rCcSave.checked) {
       window.__playNotificationBeep__("captcha");
     }
 
-    // [SELF-HEALING 3]: Handle cart refresh error in-memory with zero outer retry delay
-    if (isCartRefreshError(responseBody)) {
-      writeLog("Phát hiện giỏ hàng vừa cập nhật giá/kho; đang đồng bộ lại song song siêu tốc...");
-      const refreshed = await ensureFreshCart(checkoutBody, input, init);
-      if (refreshed) {
-        try {
-          // Instantly re-request fresh checkout data
-          const headers = copyRequestHeaders(input, init);
-          const freshCheckoutRes = await nativeFetch(checkoutPath, {
-            method: "POST",
-            headers,
-            credentials: (init && init.credentials) || "include",
-            body: JSON.stringify(checkoutBody),
-            keepalive: true
-          });
-          const freshCheckoutData = await freshCheckoutRes.json().catch(() => null);
-
-          if (freshCheckoutData && (!freshCheckoutData.error || Number(freshCheckoutData.error) === 0)) {
-            // Verify item price on the refreshed checkout
-            const { itemPriceVND: freshItemVND, totalPayableVND: freshTotalVND, shippingFeeVND: freshShipVND } = extractOrderPrices(freshCheckoutData);
-
-            writeLog(
-              `[Chi tiết sau sync] Tiền hàng: ${freshItemVND.toLocaleString("vi-VN")}đ | Phí ship: ${freshShipVND.toLocaleString("vi-VN")}đ | Tổng thanh toán: ${freshTotalVND.toLocaleString("vi-VN")}đ`,
-              "info"
-            );
-
-            if (window.maxBuyPrice && window.maxBuyPrice > 0 && freshItemVND > window.maxBuyPrice) {
-              writeLog(
-                `🚨 [CHẶN GIÁ TRẦN] Sau khi cập nhật giỏ, tiền hàng (${freshItemVND.toLocaleString("vi-VN")}đ) VƯỢT QUÁ giá tối đa (${window.maxBuyPrice.toLocaleString("vi-VN")}đ). ĐÃ HỦY ĐƠN!`,
-                "error"
-              );
-              window.__playNotificationBeep__("price_limit");
-              stopAllAutoBuy();
-              return new Response(
-                JSON.stringify({
-                  error: 999999,
-                  error_msg: `Tiền hàng sau cập nhật (${freshItemVND.toLocaleString("vi-VN")}đ) vượt quá giá tối đa (${window.maxBuyPrice.toLocaleString("vi-VN")}đ).`,
-                }),
-                { status: 200, headers: { "content-type": "application/json" } }
-              );
-            }
-
-            // If the original request was place_order, execute fresh place_order immediately
-            if (urlStr.includes(placeOrderPath)) {
-              writeLog(`Đã đồng bộ giỏ hàng siêu tốc (Tiền hàng: ${freshItemVND.toLocaleString("vi-VN")}đ); đang đặt hàng ngay...`);
-              const nowSec = Math.floor(Date.now() / 1000);
-              const newPlaceOrderBody = {
-                ...checkoutBody,
-                timestamp: nowSec,
-                checkout_session_id: `${String(checkoutBody.checkout_session_id || "").split("-")[0] || "session"}-${Date.now()}`,
-                shoporders: freshCheckoutData.shoporders || checkoutBody.shoporders,
-                selected_payment_channel_data: freshCheckoutData.selected_payment_channel_data || checkoutBody.selected_payment_channel_data,
-                promotion_data: freshCheckoutData.promotion_data || checkoutBody.promotion_data,
-              };
-              if (freshCheckoutData._cft) {
-                newPlaceOrderBody._cft = freshCheckoutData._cft;
-              }
-
-              const freshPlaceRes = await nativeFetch(placeOrderPath, {
-                method: "POST",
-                headers,
-                credentials: (init && init.credentials) || "include",
-                body: JSON.stringify(newPlaceOrderBody),
-                keepalive: true
-              });
-              const freshPlaceData = await freshPlaceRes.clone().json().catch(() => null);
-              if (freshPlaceRes.ok && freshPlaceData && (!freshPlaceData.error || Number(freshPlaceData.error) === 0)) {
-                window.__playNotificationBeep__("success");
-                writeLog("🎉 Đặt hàng thành công qua Fast-Recovery Pipeline!", "success");
-              }
-              return freshPlaceRes;
-            } else {
-              // Return the fresh checkout response
-              return new Response(JSON.stringify(freshCheckoutData), {
-                status: 200,
-                headers: { "content-type": "application/json" }
-              });
-            }
-          }
-        } catch (recoverErr) {
-          writeLog(`Lỗi Fast Recovery: ${recoverErr.message}`, "warn");
-        }
-      }
-    }
-
     return response;
   };
 
   window.__ANM_CART_REFRESH_FIX_NATIVE_FETCH__ = nativeFetch;
 })();
-
