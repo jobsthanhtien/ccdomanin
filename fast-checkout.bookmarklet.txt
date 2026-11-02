@@ -1,0 +1,13 @@
+CHẠY BẢN TỐI ƯU VOUCHER SHOP
+
+1. Mở https://shopee.vn/ và đăng nhập. Tải lại trang trước mỗi lần nạp tool; không chạy chồng với bản cũ.
+2. Tạo dấu trang trong trình duyệt, đặt tên “Shopee voucher nhanh”. Dán nguyên dòng javascript: bên dưới vào ô URL/Địa chỉ của dấu trang, rồi lưu.
+3. Khi đang ở Shopee, bấm dấu trang để tải và mở giao diện tool. Nếu trình duyệt báo lỗi tải, tải lại trang rồi thử lại.
+4. Chọn sản phẩm, chọn và kiểm tra đúng mã shop, nhập giá tối đa, đặt giờ, chỉnh các mốc trong bảng Fast Checkout rồi tự bấm Bắt đầu. Dấu trang chỉ nạp giao diện; thao tác này không tự bấm mua hay đặt đơn.
+
+Mặc định checkout gửi ở mốc mở mã, đặt đơn ngay khi checkout hợp lệ. Muốn đặt đơn sớm nhất ở +1 giây, đặt độ lệch Đặt đơn thành 1000 ms. Đây là mốc gửi yêu cầu, không bảo đảm thời gian Shopee xử lý hoặc giữ được voucher.
+
+DÒNG URL CHO DẤU TRANG (chỉ sao chép đúng một dòng tiếp theo):
+javascript:(()=>{if(!["shopee.vn","www.shopee.vn"].includes(location.hostname)){alert("Hãy mở https://shopee.vn/ rồi bấm dấu trang này.");return;}if(window.__ANM_OPTIMIZED_LOADER__||window.VOUCHER_SCRIPT_LOADED||window.VOUCHER_SCRIPT_RUNNING||window.__ANM_FAST__||typeof window.shopeeAutoOrder==="function"){alert("Tool đã được nạp. Hãy tải lại trang Shopee rồi bấm dấu trang để tránh chạy chồng.");return;}window.__ANM_OPTIMIZED_LOADER__=true;const s=document.createElement("script");s.src="https://cdn.jsdelivr.net/gh/jobsthanhtien/ccdomanin@main/modified_script.optimized.js";s.async=true;s.onerror=()=>alert("Không tải được tool. Kiểm tra kết nối, tải lại trang Shopee rồi thử lại.");(document.head||document.documentElement).appendChild(s);})();
+
+Liên kết này tải bản tối ưu trên nhánh main.
